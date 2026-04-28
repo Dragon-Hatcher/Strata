@@ -222,6 +222,7 @@ private def targetTypeName (target : StmtExprMd) : ResolveM (Option String) := d
     | some (_, node) =>
       match node.getType.val with
       | .UserDefined typRef => pure (some typRef.text)
+      | .TArray _ => pure (some arrayCompositeName)
       | _ => pure none
     | none => pure none
   | _ => pure none
@@ -281,6 +282,12 @@ def resolveHighType (ty : HighTypeMd) : ResolveM HighTypeMd := do
     let kt' ← resolveHighType kt
     let vt' ← resolveHighType vt
     pure (.TMap kt' vt')
+  | .TSeq et =>
+    let et' ← resolveHighType et
+    pure (.TSeq et')
+  | .TArray et =>
+    let et' ← resolveHighType et
+    pure (.TArray et')
   | .Applied base args =>
     let base' ← resolveHighType base
     let args' ← args.mapM resolveHighType
@@ -406,6 +413,11 @@ def resolveStmtExpr (exprMd : StmtExprMd) : ResolveM StmtExprMd := do
       let ty' ← resolveHighType ty
       pure (.Hole det ty')
     | none => pure (.Hole det none)
+  | .Subscript target index update =>
+    let target' ← resolveStmtExpr target
+    let index' ← resolveStmtExpr index
+    let update' ← update.attach.mapM (fun a => have := a.property; resolveStmtExpr a.val)
+    pure (.Subscript target' index' update')
   return { val := val', source := source }
   termination_by exprMd
   decreasing_by all_goals term_by_mem
@@ -557,6 +569,8 @@ private def collectHighType (map : Std.HashMap Nat ResolvedNode) (ty : HighTypeM
   | .TMap kt vt =>
     let map := collectHighType map kt
     collectHighType map vt
+  | .TSeq et => collectHighType map et
+  | .TArray et => collectHighType map et
   | .Applied base args =>
     let map := collectHighType map base
     args.foldl collectHighType map
@@ -624,6 +638,12 @@ private def collectStmtExpr (map : Std.HashMap Nat ResolvedNode) (expr : StmtExp
     let map := collectStmtExpr map val
     collectStmtExpr map proof
   | .ContractOf _ fn => collectStmtExpr map fn
+  | .Subscript target index update =>
+    let map := collectStmtExpr map target
+    let map := collectStmtExpr map index
+    match update with
+    | some u => collectStmtExpr map u
+    | none => map
   | .New _ | .This | .Exit _ | .LiteralInt _ | .LiteralBool _ | .LiteralString _ | .LiteralDecimal _
   | .Abstract | .All | .Hole _ _ => map
 
