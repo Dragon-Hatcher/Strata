@@ -16,6 +16,7 @@ public import Strata.Languages.Boole.Verify
 import Strata.DL.Imperative.SMTUtils
 public import Strata.DL.SMT.Denote
 public import Strata.DL.SMT.Translate
+public import Strata.LeanExtract
 
 open Lean hiding Options
 
