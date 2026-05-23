@@ -193,6 +193,30 @@ where
     | .typeDecl _ _ => return store
 
 /--
+Replace `Bool.casesOn motive (decide p inst) falseCase trueCase` with
+`@ite ty p inst trueCase falseCase` throughout an expression, producing the
+idiomatic `if p then trueCase else falseCase` form.
+-/
+partial def simpBoolCasesOn (e : Lean.Expr) : MetaM Lean.Expr :=
+  match e with
+  -- Bool.casesOn [u] motive (decide [] prop inst) falseCase trueCase
+  -- → @ite [u] ty prop inst trueCase falseCase
+  | .app (.app (.app (.app (.const ``Bool.casesOn [u]) motive) cond) falseCase) trueCase => do
+    let cond'      ← simpBoolCasesOn cond
+    let falseCase' ← simpBoolCasesOn falseCase
+    let trueCase'  ← simpBoolCasesOn trueCase
+    match cond' with
+    | .app (.app (.const ``decide []) prop) decInst => do
+      let ty ← Meta.inferType trueCase'
+      return mkApp5 (.const ``ite [u]) ty prop decInst trueCase' falseCase'
+    | _ =>
+      return mkApp4 (.const ``Bool.casesOn [u]) motive cond' falseCase' trueCase'
+  | .app f a         => return .app (← simpBoolCasesOn f) (← simpBoolCasesOn a)
+  | .lam n t b bi    => return .lam n t (← simpBoolCasesOn b) bi
+  | .letE n t v b nd => return .letE n t (← simpBoolCasesOn v) (← simpBoolCasesOn b) nd
+  | _                => return e
+
+/--
 Translate a Core procedure to a Lean function expression.
 
 Creates a Lean FVar per input, symbolically executes the body, reads the
@@ -214,7 +238,7 @@ def translateProcedure (proc : Core.Procedure) : MetaM Lean.Expr := do
       | none   => throwError s!"extract_def: output '{id.name}' was not assigned"
     if outputExprs.isEmpty then throwError "extract_def: procedure has no outputs"
     if outputExprs.length > 1 then throwError "extract_def: multiple outputs are not yet supported"
-    let resultExpr := outputExprs[0]!
+    let resultExpr ← simpBoolCasesOn outputExprs[0]!
     Meta.mkLambdaFVars fvars resultExpr
 
 end LeanExtract

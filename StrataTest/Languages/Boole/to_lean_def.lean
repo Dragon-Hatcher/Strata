@@ -35,8 +35,4 @@ def lean_max (a b : Int) : Int := if a > b then a else b
 def strata_max : Int → Int → Int := extract_def find_max_program "Max"
 
 theorem equivalent : ∀ a b : Int, strata_max a b = lean_max a b := by
-  intro a b
-  unfold strata_max lean_max
-  by_cases h : a > b
-  · simp [if_pos h, show decide (a > b) = true from decide_eq_true_iff.mpr h]
-  · simp [if_neg h, show decide (a > b) = false from decide_eq_false_iff_not.mpr h]
+  intro a b; rfl
