@@ -41,8 +41,11 @@ abbrev Store := Std.HashMap String Lean.Expr
 
 /-- Translate a monomorphic Core type to a Lean type expression. -/
 def translateTy : Lambda.LMonoTy → MetaM Lean.Expr
-  | .tcons "int" []  => return .const ``Int []
-  | .tcons "bool" [] => return .const ``Bool []
+  | .tcons "int" []           => return .const ``Int []
+  | .tcons "bool" []          => return .const ``Bool []
+  | .tcons "Sequence" [elem]  => do
+    let leanElem ← translateTy elem
+    Meta.mkAppM ``List #[leanElem]
   | ty => throwError s!"extract_def: unsupported type {repr ty}"
 
 /--
@@ -81,14 +84,43 @@ private def applyBinOp (opName : String) (e1 e2 : Lean.Expr) : MetaM Lean.Expr :
   | "Bool.Implies" => return mkApp2 (.const ``Bool.or [])
                                (mkApp (.const ``Bool.not []) e1) e2
   | "Bool.Equiv"   => decideExpr (← Meta.mkAppM ``Eq #[e1, e2])
+  -- Sequence binary ops (e1 = sequence, e2 = second arg)
+  | "Sequence.append"   => Meta.mkAppM ``List.append #[e1, e2]
+  | "Sequence.build"    => Meta.mkAppM ``List.concat #[e1, e2]
+  | "Sequence.take"     => do
+    let n ← Meta.mkAppM ``Int.toNat #[e2]
+    Meta.mkAppM ``List.take #[n, e1]
+  | "Sequence.drop"     => do
+    let n ← Meta.mkAppM ``Int.toNat #[e2]
+    Meta.mkAppM ``List.drop #[n, e1]
+  | "Sequence.select"   => do
+    let i    ← Meta.mkAppM ``Int.toNat #[e2]
+    let listTy ← Meta.inferType e1
+    let elemTy := listTy.appArg!
+    let u      ← Meta.getLevel elemTy
+    let inst   ← Meta.synthInstance (.app (.const ``Inhabited [u]) elemTy)
+    let dflt   ← Meta.mkAppOptM ``default #[some elemTy, some inst]
+    Meta.mkAppM ``List.getD #[e1, i, dflt]
+  | "Sequence.contains" => Meta.mkAppM ``List.elem #[e2, e1]
   | _ => throwError s!"extract_def: unsupported binary op '{opName}'"
 
 /-- Apply a unary Core operator to a translated Lean expression. -/
 private def applyUnaryOp (opName : String) (e : Lean.Expr) : MetaM Lean.Expr := do
   match opName with
-  | "Int.Neg"  => Meta.mkAppM ``Neg.neg #[e]
-  | "Bool.Not" => return mkApp (.const ``Bool.not []) e
+  | "Int.Neg"        => Meta.mkAppM ``Neg.neg #[e]
+  | "Bool.Not"       => return mkApp (.const ``Bool.not []) e
+  | "Sequence.length" => do
+    let n ← Meta.mkAppM ``List.length #[e]
+    Meta.mkAppM ``Int.ofNat #[n]
   | _ => throwError s!"extract_def: unsupported unary op '{opName}'"
+
+/-- Apply a ternary Core operator to three translated Lean expressions. -/
+private def applyTernaryOp (opName : String) (e1 e2 e3 : Lean.Expr) : MetaM Lean.Expr := do
+  match opName with
+  | "Sequence.update" => do
+    let i ← Meta.mkAppM ``Int.toNat #[e2]
+    Meta.mkAppM ``List.set #[e1, i, e3]
+  | _ => throwError s!"extract_def: unsupported ternary op '{opName}'"
 
 /-- Translate a Core expression to a Lean expression given a symbolic store. -/
 partial def translateExpr (store : Store) : Core.Expression.Expr → MetaM Lean.Expr
@@ -111,6 +143,12 @@ partial def translateExpr (store : Store) : Core.Expression.Expr → MetaM Lean.
     let e1' ← translateExpr store e1
     let e2' ← translateExpr store e2
     decideExpr (← Meta.mkAppM ``Eq #[e1', e2'])
+  -- Ternary application: ((op e1) e2) e3
+  | .app () (.app () (.app () (.op () id _) e1) e2) e3 => do
+    let e1' ← translateExpr store e1
+    let e2' ← translateExpr store e2
+    let e3' ← translateExpr store e3
+    applyTernaryOp id.name e1' e2' e3'
   -- Binary application: (op e1) e2
   | .app () (.app () (.op () id _) e1) e2 => do
     let e1' ← translateExpr store e1
@@ -122,6 +160,13 @@ partial def translateExpr (store : Store) : Core.Expression.Expr → MetaM Lean.
     applyUnaryOp id.name e'
   | .app () _ _ =>
     throwError "extract_def: unsupported application form in expression"
+  -- Nullary ops: only Sequence.empty is supported
+  | .op () id (some (.tcons "Sequence" [elemTy])) =>
+    match id.name with
+    | "Sequence.empty" => do
+      let leanElem ← translateTy elemTy
+      Meta.mkAppOptM ``List.nil #[some leanElem]
+    | _ => throwError s!"extract_def: bare op '{id.name}' without application"
   | .op () id _ =>
     throwError s!"extract_def: bare op '{id.name}' without application"
   | .bvar () i =>

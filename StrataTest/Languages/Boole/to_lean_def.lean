@@ -30,9 +30,8 @@ theorem find_max_program_smt_vcs_correct : Strata.smtVCsCorrect find_max_program
   gen_smt_vcs
   all_goals (try grind)
 
-def lean_max (a b : Int) : Int := if a > b then a else b
-
 def strata_max : Int → Int → Int := extract_def find_max_program "Max"
 
-theorem equivalent : ∀ a b : Int, strata_max a b = lean_max a b := by
-  intro a b; rfl
+theorem equivalent : ∀ a b : Int, strata_max a b = max a b := by
+  unfold strata_max
+  grind
