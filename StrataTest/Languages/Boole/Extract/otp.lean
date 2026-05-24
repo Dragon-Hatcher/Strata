@@ -104,3 +104,42 @@ implementation runs via `@[implemented_by]`, so `#eval` works normally.
   let dec  := strata_decrypt key enc
   (enc, dec)  -- expected: ([11, 22, 33], [10, 20, 30])
 
+/-!
+Correctness proofs: the extracted functions agree with the Lean reference implementations
+for equal-length inputs.  The key and message must have the same length; otherwise the
+Boole program pads the shorter list with defaults (0 / []) while `lean_encrypt`/
+`lean_decrypt` return [] early.
+
+Both proofs go by induction on the key list and case-split on the message list.
+Each cons case closes by `rfl` because `strata_encrypt`/`strata_decrypt` are
+transparent `List.rec` definitions whose case bodies reduce definitionally.
+-/
+
+theorem encrypt_correct : ∀ key msg : List Int, key.length = msg.length →
+    strata_encrypt key msg = lean_encrypt key msg := by
+  intro key
+  induction key with
+  | nil => intro msg _; rfl
+  | cons h t ih =>
+      intro msg hmatch
+      cases msg with
+      | nil => simp at hmatch
+      | cons m ms =>
+          simp only [List.length, Nat.succ.injEq] at hmatch
+          simp only [lean_encrypt, ← ih ms hmatch]
+          rfl
+
+theorem decrypt_correct : ∀ key cipher : List Int, key.length = cipher.length →
+    strata_decrypt key cipher = lean_decrypt key cipher := by
+  intro key
+  induction key with
+  | nil => intro cipher _; rfl
+  | cons h t ih =>
+      intro cipher hmatch
+      cases cipher with
+      | nil => simp at hmatch
+      | cons c cs =>
+          simp only [List.length, Nat.succ.injEq] at hmatch
+          simp only [lean_decrypt, ← ih cs hmatch]
+          rfl
+

@@ -385,17 +385,19 @@ where
         unless lhsVars.length == 1 do
           throwError s!"extract_def: recursive call to '{procName}' must have exactly 1 output"
         if !ctx.structRecResults.isEmpty then
-          -- Structural mode: whnf the argument to reach the field free variable,
-          -- then look up the pre-bound inductive-hypothesis variable.
-          unless translatedInputs.length == 1 do
-            throwError s!"extract_def: structural recursive call must have exactly 1 argument"
+          -- Structural mode: whnf the first argument to reach the field free variable,
+          -- look up the pre-bound IH, then apply it to any extra arguments.
+          unless translatedInputs.length >= 1 do
+            throwError s!"extract_def: structural recursive call needs at least 1 argument"
           let arg ← Meta.whnf translatedInputs[0]!
           let .fvar fid := arg
             | throwError s!"extract_def: structural recursive call argument did not \
                 reduce to a field variable (got {repr arg})"
           let some ihExpr := ctx.structRecResults[fid]?
             | throwError s!"extract_def: structural recursive call on unrecognized field FVar"
-          return store.insert lhsVars[0]!.name ihExpr
+          -- Apply the IH to any extra arguments (inputs after the structural parameter).
+          let result := (translatedInputs.drop 1).foldl Lean.mkApp ihExpr
+          return store.insert lhsVars[0]!.name result
         else
           let recApp := translatedInputs.foldl Lean.mkApp selfExpr
           return store.insert lhsVars[0]!.name recApp
@@ -553,7 +555,8 @@ private def buildStructuralCase (ctx : ExtractCtx) (proc : Core.Procedure)
     (structParamName : String) (leanIndType : Lean.Expr) (indName : Name)
     (typeArgs : Array Lean.Expr)
     (booleConstr : Lambda.LConstr Unit) (leanCtorName : Name)
-    (retType : Lean.Expr) : MetaM Lean.Expr := do
+    (retType : Lean.Expr)
+    (extraInputs : List (String × Lean.Expr) := []) : MetaM Lean.Expr := do
   -- Collect (fieldName, leanType, isRecursive) for each constructor field in declaration order.
   let fieldInfo ← booleConstr.args.mapM fun (id, booleTy) => do
     let leanTy ← translateTyWithMap ctx.typeMap booleTy
@@ -571,6 +574,10 @@ private def buildStructuralCase (ctx : ExtractCtx) (proc : Core.Procedure)
     if isRec then
       let retType' := retType
       decls := decls.push (Name.mkSimple s!"ih_{fname}", .default, fun _ => pure retType')
+  -- Extra (non-structural) inputs follow the IH binders.
+  for (ename, eTy) in extraInputs do
+    let eTy' := eTy
+    decls := decls.push (Name.mkSimple ename, .default, fun _ => pure eTy')
   Meta.withLocalDecls decls fun allFvars => do
     -- First fieldInfo.size fvars are the constructor fields in declaration order.
     -- The remaining fvars are IHs for recursive fields, also in declaration order.
@@ -596,7 +603,12 @@ private def buildStructuralCase (ctx : ExtractCtx) (proc : Core.Procedure)
     let recCtx := { ctx with
       selfProc         := some (proc.header.name.name, .const ``Unit [])  -- dummy; srr handles it
       structRecResults := srr }
-    let initStore : Store := ({} : Store).insert structParamName ctorApp
+    -- Seed the store: structural param → constructor, extra inputs → their fvars.
+    -- ihIdx now points just past the last IH fvar, i.e. at the first extra-input fvar.
+    let mut initStore := ({} : Store).insert structParamName ctorApp
+    for (ename, _) in extraInputs do
+      initStore := initStore.insert ename allFvars[ihIdx]!
+      ihIdx := ihIdx + 1
     let finalStore ← executeStmts recCtx initStore proc.body
     let outputName := proc.header.outputs.toList[0]!.1.name
     let some resultExpr := finalStore[outputName]?
@@ -620,10 +632,9 @@ parameters), falling back to the `@[implemented_by]` opaque approach.
 -/
 private def tryStructuralRec (ctx : ExtractCtx) (proc : Core.Procedure)
     : MetaM (Option Lean.Expr) := do
-  -- Only handle procedures with a single input parameter of a user-defined inductive type.
+  -- Structural recursion requires at least one input; the FIRST must be an inductive type.
   let inputs := proc.header.inputs.toList
-  unless inputs.length == 1 do return none
-  let (paramId, paramBooleTy) := inputs[0]!
+  let some (paramId, paramBooleTy) := inputs.head? | return none
   let .tcons tyName [] := paramBooleTy | return none
   let some leanIndType := ctx.typeMap[tyName]? | return none
   let some indName := leanIndType.getAppFn.constName? | return none
@@ -641,12 +652,19 @@ private def tryStructuralRec (ctx : ExtractCtx) (proc : Core.Procedure)
   let retType ← translateTy ctx retBooleTy
   let numParams := indInfo.numParams
   let typeArgs  := leanIndType.getAppArgs
-  let motive    := Lean.Expr.lam `_ leanIndType retType .default
+  -- Extra (non-structural) inputs: all inputs after the structural parameter.
+  let extraInputsRaw := inputs.tail
+  let extraInputs ← extraInputsRaw.mapM fun (id, booleTy) => do
+    let leanTy ← translateTy ctx booleTy
+    return (id.name, leanTy)
+  -- IH type = motive applied to a recursive field = (extraTypes → retType).
+  let fullRetType ← extraInputs.foldrM (fun (_, eTy) acc => mkArrow eTy acc) retType
+  let motive    := Lean.Expr.lam `_ leanIndType fullRetType .default
   -- Build one case expression per constructor.
   let mut caseExprs : Array Lean.Expr := #[]
   for (booleConstr, leanCtorName) in dt.constrs.zip indInfo.ctors do
     let caseExpr ← buildStructuralCase ctx proc paramId.name leanIndType indName
-        typeArgs booleConstr leanCtorName retType
+        typeArgs booleConstr leanCtorName fullRetType extraInputs
     caseExprs := caseExprs.push caseExpr
   -- Apply T.rec to the motive and all cases; let Lean infer universe levels.
   let nones := (List.replicate numParams (none : Option Lean.Expr)).toArray
