@@ -53,6 +53,9 @@ structure ExtractCtx where
   /-- When extracting a recursive procedure, holds `(procName, selfExpr)` so that
       recursive calls are replaced by applications of the partial def being built. -/
   selfProc : Option (String × Lean.Expr) := none
+  /-- For structural recursion: maps each recursive field's FVarId to the corresponding
+      inductive-hypothesis free variable.  Non-empty only during `buildStructuralCase`. -/
+  structRecResults : Std.HashMap FVarId Lean.Expr := {}
 
 /-- Check whether a procedure's body contains a self-recursive call. -/
 private partial def hasSelfCall (procName : String) (stmts : List Core.Statement) : Bool :=
@@ -376,13 +379,26 @@ where
     let inputExprs := Core.CallArg.getInputExprs callArgs
     let translatedInputs ← inputExprs.mapM (translateExpr ctx store)
     let lhsVars := Core.CallArg.getLhs callArgs
-    -- If this is a recursive self-call, apply the partial-def reference
+    -- If this is a recursive self-call, resolve via structural IH or the opaque ref
     if let some (selfName, selfExpr) := ctx.selfProc then
       if procName == selfName then
-        let recApp := translatedInputs.foldl Lean.mkApp selfExpr
         unless lhsVars.length == 1 do
           throwError s!"extract_def: recursive call to '{procName}' must have exactly 1 output"
-        return store.insert lhsVars[0]!.name recApp
+        if !ctx.structRecResults.isEmpty then
+          -- Structural mode: whnf the argument to reach the field free variable,
+          -- then look up the pre-bound inductive-hypothesis variable.
+          unless translatedInputs.length == 1 do
+            throwError s!"extract_def: structural recursive call must have exactly 1 argument"
+          let arg ← Meta.whnf translatedInputs[0]!
+          let .fvar fid := arg
+            | throwError s!"extract_def: structural recursive call argument did not \
+                reduce to a field variable (got {repr arg})"
+          let some ihExpr := ctx.structRecResults[fid]?
+            | throwError s!"extract_def: structural recursive call on unrecognized field FVar"
+          return store.insert lhsVars[0]!.name ihExpr
+        else
+          let recApp := translatedInputs.foldl Lean.mkApp selfExpr
+          return store.insert lhsVars[0]!.name recApp
     -- Non-recursive case: inline the callee
     let some callee := Core.Program.Procedure.find? ctx.program procName
       | throwError s!"extract_def: called procedure '{procName}' not found"
@@ -437,6 +453,14 @@ where
       translateCall ctx store procName callArgs
     | .ite (.det condE) trueBranch falseBranch _ => do
       let condExpr ← translateExpr ctx store condE
+      -- Short-circuit if the condition reduces to a Bool literal (e.g., a tester applied to
+      -- a known constructor in structural-recursion mode).  This avoids executing unreachable
+      -- branches that could contain unresolvable recursive calls.
+      let condWhnf ← Meta.whnf condExpr
+      if condWhnf == .const ``true [] then
+        return ← executeStmts ctx store trueBranch
+      else if condWhnf == .const ``false [] then
+        return ← executeStmts ctx store falseBranch
       let storeT   ← executeStmts ctx store trueBranch
       let storeF   ← executeStmts ctx store falseBranch
       mergeStores condExpr store storeT storeF
@@ -514,10 +538,164 @@ private def buildFunTypeAndDefault (ctx : ExtractCtx) (proc : Core.Procedure)
   return (funType, defaultVal)
 
 /--
+Build one case argument for `T.rec` from a Boole constructor.
+
+For each constructor field `f : F`:
+  - If `F` is the inductive type being recursed over, bind `(f : F)` then `(ih_f : RetType)`.
+  - Otherwise, bind only `(f : F)`.
+
+The procedure body is symbolically executed with the structural parameter bound to the
+full constructor application, and each recursive field's free variable mapped to its IH.
+A final `Meta.whnf` step reduces `casesOn`-over-constructor redexes so the resulting
+lambda is definitionally clean.
+-/
+private def buildStructuralCase (ctx : ExtractCtx) (proc : Core.Procedure)
+    (structParamName : String) (leanIndType : Lean.Expr) (indName : Name)
+    (typeArgs : Array Lean.Expr)
+    (booleConstr : Lambda.LConstr Unit) (leanCtorName : Name)
+    (retType : Lean.Expr) : MetaM Lean.Expr := do
+  -- Collect (fieldName, leanType, isRecursive) for each constructor field in declaration order.
+  let fieldInfo ← booleConstr.args.mapM fun (id, booleTy) => do
+    let leanTy ← translateTyWithMap ctx.typeMap booleTy
+    let isRec  := leanTy.getAppFn.constName? == some indName
+    return (id.name, leanTy, isRec)
+  -- Lean 4's recursor convention: ALL constructor fields first (in declaration order),
+  -- then IHs for each recursive field (in their declaration order).
+  -- e.g. for node (left : T) (value : Int) (right : T):
+  --   left, value, right, ih_left, ih_right
+  let mut decls : Array (Name × BinderInfo × (Array Lean.Expr → MetaM Lean.Expr)) := #[]
+  for (fname, fTy, _) in fieldInfo do
+    let fTy' := fTy
+    decls := decls.push (Name.mkSimple fname, .default, fun _ => pure fTy')
+  for (fname, _, isRec) in fieldInfo do
+    if isRec then
+      let retType' := retType
+      decls := decls.push (Name.mkSimple s!"ih_{fname}", .default, fun _ => pure retType')
+  Meta.withLocalDecls decls fun allFvars => do
+    -- First fieldInfo.size fvars are the constructor fields in declaration order.
+    -- The remaining fvars are IHs for recursive fields, also in declaration order.
+    let mut nameToFvar : Std.HashMap String Lean.Expr := {}
+    let mut srr        : Std.HashMap FVarId Lean.Expr := {}
+    let mut fieldIdx := 0
+    for (fname, _, _) in fieldInfo do
+      nameToFvar := nameToFvar.insert fname allFvars[fieldIdx]!
+      fieldIdx := fieldIdx + 1
+    let mut ihIdx := fieldInfo.length
+    let mut recIdx := 0
+    for (_, _, isRec) in fieldInfo do
+      if isRec then
+        let fieldFvar := allFvars[recIdx]!
+        let ihFvar    := allFvars[ihIdx]!
+        srr := srr.insert fieldFvar.fvarId! ihFvar
+        ihIdx := ihIdx + 1
+      recIdx := recIdx + 1
+    -- Constructor applied to field vars in DECLARATION order.
+    let declOrderFvars := (fieldInfo.map fun (fname, _, _) => nameToFvar[fname]!).toArray
+    let ctorApp ← Meta.mkAppOptM leanCtorName (typeArgs.map some ++ declOrderFvars.map some)
+    -- Execute the body with the structural param bound to the constructor.
+    let recCtx := { ctx with
+      selfProc         := some (proc.header.name.name, .const ``Unit [])  -- dummy; srr handles it
+      structRecResults := srr }
+    let initStore : Store := ({} : Store).insert structParamName ctorApp
+    let finalStore ← executeStmts recCtx initStore proc.body
+    let outputName := proc.header.outputs.toList[0]!.1.name
+    let some resultExpr := finalStore[outputName]?
+      | throwError s!"extract_def (structural): output '{outputName}' not assigned"
+    -- Instantiate any metavariables before reduction/abstraction.
+    let resultExpr ← instantiateMVars resultExpr
+    -- Reduce casesOn-over-ctor redexes so the case body is clean.
+    let resultExpr ← Meta.whnf resultExpr
+    let resultExpr ← instantiateMVars resultExpr
+    Meta.mkLambdaFVars allFvars resultExpr
+
+/--
+Try to generate a transparent structurally-recursive Lean expression for a procedure.
+
+Applies when the procedure has exactly one input parameter of a user-defined inductive type.
+The result is `T.rec motive case₀ … caseₙ`, which is transparent to Lean's kernel and
+allows correctness theorems to be proved by `rfl` or `simp`.
+
+Returns `none` if the procedure does not meet these criteria (e.g., has multiple inductive
+parameters), falling back to the `@[implemented_by]` opaque approach.
+-/
+private def tryStructuralRec (ctx : ExtractCtx) (proc : Core.Procedure)
+    : MetaM (Option Lean.Expr) := do
+  -- Only handle procedures with a single input parameter of a user-defined inductive type.
+  let inputs := proc.header.inputs.toList
+  unless inputs.length == 1 do return none
+  let (paramId, paramBooleTy) := inputs[0]!
+  let .tcons tyName [] := paramBooleTy | return none
+  let some leanIndType := ctx.typeMap[tyName]? | return none
+  let some indName := leanIndType.getAppFn.constName? | return none
+  let env ← getEnv
+  let some constInfo := env.find? indName | return none
+  let .inductInfo indInfo := constInfo | return none
+  let mDt := ctx.program.decls.findSome? fun d =>
+    match d.getTypeDecl? with
+    | some (.data block) => block.find? (·.name == tyName)
+    | _ => none
+  let some dt := mDt | return none
+  unless dt.constrs.length == indInfo.ctors.length do return none
+  -- Return type.
+  let [(_, retBooleTy)] := proc.header.outputs.toList | return none
+  let retType ← translateTy ctx retBooleTy
+  let numParams := indInfo.numParams
+  let typeArgs  := leanIndType.getAppArgs
+  let motive    := Lean.Expr.lam `_ leanIndType retType .default
+  -- Build one case expression per constructor.
+  let mut caseExprs : Array Lean.Expr := #[]
+  for (booleConstr, leanCtorName) in dt.constrs.zip indInfo.ctors do
+    let caseExpr ← buildStructuralCase ctx proc paramId.name leanIndType indName
+        typeArgs booleConstr leanCtorName retType
+    caseExprs := caseExprs.push caseExpr
+  -- Apply T.rec to the motive and all cases; let Lean infer universe levels.
+  let nones := (List.replicate numParams (none : Option Lean.Expr)).toArray
+  let recExpr ← Meta.mkAppOptM (Name.str indName "rec")
+      (nones ++ #[some motive] ++ caseExprs.map some)
+  -- Build the function type (for registering aux constants).
+  let inputsList  := proc.header.inputs.toList
+  let outputsList := proc.header.outputs.toList
+  let outputType  ← translateTy ctx outputsList[0]!.2
+  let inputTypes  ← inputsList.mapM fun (_, ty) => translateTy ctx ty
+  let funType     ← inputTypes.foldrM (fun a b => liftM (mkArrow a b)) outputType
+  --
+  -- Two-phase registration for computability + provability:
+  --
+  -- recTranspName: added kernel-only (addDecl, not addAndCompile) with the T.rec body.
+  --   → Lean's kernel sees the transparent T.rec body; proofs can unfold it.
+  -- recImplName:   compiled unsafe impl using casesOn + self-ref via recTranspName.
+  --   → The code generator uses this for runtime execution.
+  -- @[implemented_by] recTranspName → recImplName ensures #eval uses the computable path.
+  --
+  let procName    := proc.header.name.name
+  let recTranspName ← Lean.mkAuxDeclName (Name.mkSimple s!"_extract_{procName}_spec")
+  let recImplName   ← Lean.mkAuxDeclName (Name.mkSimple s!"_extract_{procName}_impl")
+  -- Phase 1: add the transparent spec constant (kernel only, no code generation).
+  Lean.addDecl (.defnDecl {
+    name := recTranspName, levelParams := [], type := funType,
+    value := recExpr, hints := .abbrev, safety := .safe, all := [recTranspName]
+  })
+  -- Phase 2: pre-register the @[implemented_by] redirect before the impl exists.
+  Lean.setImplementedBy recTranspName recImplName
+  -- Phase 3: build the casesOn-based computable body; self-calls use recTranspName.
+  let recRef   := Lean.mkConst recTranspName
+  let recCtx   := { ctx with selfProc := some (procName, recRef) }
+  let implBody ← translateProcedureBody recCtx proc
+  let implBody ← instantiateMVars implBody
+  -- Phase 4: compile the unsafe implementation.
+  addAndCompile (.defnDecl {
+    name := recImplName, levelParams := [], type := funType, value := implBody,
+    hints := .abbrev, safety := .unsafe
+  })
+  return some (Lean.mkConst recTranspName)
+
+/--
 Translate a Core procedure to a Lean function expression.
 
 For non-recursive procedures, symbolically executes the body and wraps in lambdas.
-For self-recursive procedures, uses a two-phase approach:
+For self-recursive procedures over a single user-defined inductive parameter, tries to
+generate a transparent `T.rec`-based definition that allows kernel-level proofs.
+Otherwise, falls back to a two-phase approach:
   1. Register an opaque (sorry-valued) constant so the name is visible to the kernel.
   2. Add a separate unsafe implementation whose body may reference the opaque.
   3. Register the opaque as `@[implemented_by]` the unsafe implementation.
@@ -526,6 +704,9 @@ This mirrors how Lean's own `partial def` elaborator works.
 def translateProcedure (ctx : ExtractCtx) (proc : Core.Procedure) : MetaM Lean.Expr := do
   let procName := proc.header.name.name
   if hasSelfCall procName proc.body then
+    -- Try to generate a transparent structurally-recursive definition first.
+    if let some recExpr ← tryStructuralRec ctx proc then
+      return recExpr
     -- Derive two unique names: the public opaque and its unsafe implementation.
     let recName     ← Lean.mkAuxDeclName (Name.mkSimple s!"_extract_{procName}")
     let recImplName ← Lean.mkAuxDeclName (Name.mkSimple s!"_extract_{procName}_impl")

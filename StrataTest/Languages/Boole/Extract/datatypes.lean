@@ -173,3 +173,14 @@ def lean_sum_tree : ExTree → Int
   let t : ExTree := .node (.node .leaf 1 .leaf) 2 (.node .leaf 3 .leaf)
   (strata_sum_tree t, lean_sum_tree t)  -- (6, 6)
 
+theorem sum_tree_correct : ∀ t : ExTree,
+    strata_sum_tree t = lean_sum_tree t := by
+  intro t; induction t with
+  | leaf => rfl
+  | node l v r ihl ihr =>
+      simp only [lean_sum_tree, ← ihl, ← ihr]
+      -- The extracted body computes `v + l + r`; lean_sum_tree uses `l + v + r`.
+      -- Establish the kernel reduction, then let omega handle the commutativity.
+      have h : strata_sum_tree (.node l v r) = v + strata_sum_tree l + strata_sum_tree r := rfl
+      omega
+
