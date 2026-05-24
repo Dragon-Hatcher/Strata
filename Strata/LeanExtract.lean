@@ -191,17 +191,58 @@ private def mergeStores (cond : Lean.Expr) (baseStore storeT storeF : Store) : M
   return merged
 
 /-- Symbolically execute a list of Core statements, threading the store through. -/
-partial def executeStmts (store : Store) (stmts : List Core.Statement) : MetaM Store :=
-  stmts.foldlM executeStmt store
+partial def executeStmts (program : Core.Program) (store : Store) (stmts : List Core.Statement) : MetaM Store :=
+  stmts.foldlM (executeStmt program) store
 where
+  /-- Inline a call to `procName` given the current store and call argument list. -/
+  translateCall (program : Core.Program) (store : Store) (procName : String)
+      (callArgs : List (Core.CallArg Core.Expression)) : MetaM Store := do
+    let some callee := Core.Program.Procedure.find? program procName
+      | throwError s!"extract_def: called procedure '{procName}' not found"
+    -- Translate input expressions (inoutArg ids are read from the caller store)
+    let inputExprs := Core.CallArg.getInputExprs callArgs
+    let translatedInputs ← inputExprs.mapM (translateExpr store)
+    let calleeInputList := callee.header.inputs.toList
+    unless calleeInputList.length == translatedInputs.length do
+      throwError s!"extract_def: argument count mismatch calling '{procName}' \
+          (expected {calleeInputList.length}, got {translatedInputs.length})"
+    -- Build fresh sub-store for the callee
+    let calleeStore := (calleeInputList.zip translatedInputs).foldl
+      (fun s ((id, _), e) => s.insert id.name e) {}
+    -- Symbolically execute the callee body
+    let calleeFinalStore ← executeStmts program calleeStore callee.body
+    -- Write callee outputs back into the caller store
+    let calleeOutputList := callee.header.outputs.toList
+    let lhsVars := Core.CallArg.getLhs callArgs
+    unless calleeOutputList.length == lhsVars.length do
+      throwError s!"extract_def: output count mismatch calling '{procName}' \
+          (expected {calleeOutputList.length}, got {lhsVars.length})"
+    let mut updatedStore := store
+    for ((outId, _), lhsId) in calleeOutputList.zip lhsVars do
+      let some outVal := calleeFinalStore[outId.name]?
+        | throwError s!"extract_def: output '{outId.name}' was not assigned by '{procName}'"
+      updatedStore := updatedStore.insert lhsId.name outVal
+    return updatedStore
   /-- Symbolically execute one Core statement. -/
-  executeStmt (store : Store) (stmt : Core.Statement) : MetaM Store := do
+  executeStmt (program : Core.Program) (store : Store) (stmt : Core.Statement) : MetaM Store := do
     match stmt with
     -- Deterministic assignment
     | .cmd (.cmd (.set id (.det e) _)) => do
       return store.insert id.name (← translateExpr store e)
-    | .cmd (.cmd (.init id _ (.det e) _)) => do
-      return store.insert id.name (← translateExpr store e)
+    | .cmd (.cmd (.init id ty (.det e) _)) => do
+      -- A `var x : T;` declaration in Boole lowers to `init x := fvar("init_x_N")` where
+      -- `init_x_N` is a fresh variable not in the store — treat it as havoc.
+      match e with
+      | .fvar () freshId _ =>
+        if store.contains freshId.name then
+          return store.insert id.name (← translateExpr store e)
+        else
+          let .forAll _ mty := ty
+          let leanTy ← try translateTy mty catch _ => pure (Lean.mkConst ``Int)
+          let mv ← Meta.mkFreshExprMVar leanTy
+          return store.insert id.name mv
+      | _ =>
+        return store.insert id.name (← translateExpr store e)
     -- Nondeterministic assignment: placeholder (must be overwritten later)
     | .cmd (.cmd (.set id .nondet _)) => do
       let mv ← Meta.mkFreshExprMVar (Lean.mkConst ``Int)
@@ -215,19 +256,19 @@ where
     | .cmd (.cmd (.assert _ _ _))
     | .cmd (.cmd (.assume _ _ _))
     | .cmd (.cmd (.cover  _ _ _)) => return store
-    -- Procedure calls: not supported in MVP
-    | .cmd (.call procName _ _) =>
-      throwError s!"extract_def: procedure calls ('{procName}') are not supported"
+    -- Procedure calls: inline the callee symbolically
+    | .cmd (.call procName callArgs _) =>
+      translateCall program store procName callArgs
     -- If/else
     | .ite (.det condE) trueBranch falseBranch _ => do
       let condExpr ← translateExpr store condE
-      let storeT   ← executeStmts store trueBranch
-      let storeF   ← executeStmts store falseBranch
+      let storeT   ← executeStmts program store trueBranch
+      let storeF   ← executeStmts program store falseBranch
       mergeStores condExpr store storeT storeF
     | .ite .nondet _ _ _ =>
       throwError "extract_def: nondeterministic branch conditions are not supported"
     -- Blocks: execute body sequentially
-    | .block _ body _ => executeStmts store body
+    | .block _ body _ => executeStmts program store body
     -- Loops must have been removed by loopElim
     | .loop _ _ _ _ _ =>
       throwError "extract_def: loops must be eliminated before extraction"
@@ -267,7 +308,7 @@ Translate a Core procedure to a Lean function expression.
 Creates a Lean FVar per input, symbolically executes the body, reads the
 output variable(s) from the resulting store, and wraps in lambdas.
 -/
-def translateProcedure (proc : Core.Procedure) : MetaM Lean.Expr := do
+def translateProcedure (program : Core.Program) (proc : Core.Procedure) : MetaM Lean.Expr := do
   let inputsList := proc.header.inputs.toList
   let declSpecs ← inputsList.mapM fun (id, ty) => do
     let leanTy ← translateTy ty
@@ -275,7 +316,7 @@ def translateProcedure (proc : Core.Procedure) : MetaM Lean.Expr := do
   Meta.withLocalDecls declSpecs.toArray fun fvars => do
     let store := (inputsList.zip fvars.toList).foldl
       (fun s ((id, _), fv) => s.insert id.name fv) {}
-    let finalStore ← executeStmts store proc.body
+    let finalStore ← executeStmts program store proc.body
     let outputsList := proc.header.outputs.toList
     let outputExprs ← outputsList.mapM fun (id, _) =>
       match finalStore[id.name]? with
@@ -328,7 +369,7 @@ private unsafe def elabExtractDefUnsafe
     | throwError s!"extract_def: procedure '{procName}' not found in the Core program"
 
   -- Symbolically translate the procedure to a Lean term
-  LeanExtract.translateProcedure proc
+  LeanExtract.translateProcedure coreProgram proc
 
 @[implemented_by elabExtractDefUnsafe]
 meta opaque elabExtractDefImpl
