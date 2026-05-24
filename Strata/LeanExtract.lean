@@ -47,6 +47,9 @@ structure ExtractCtx where
   program  : Core.Program
   /-- Maps Boole datatype name (e.g. `"List"`) to its Lean type expr (e.g. `List Int`). -/
   typeMap  : Std.HashMap String Lean.Expr := {}
+  /-- Maps Boole op names (constructors, testers, destructors) to the Lean function
+      expressions that implement them for the user-annotated Lean types. -/
+  opMap    : Std.HashMap String Lean.Expr := {}
   /-- When extracting a recursive procedure, holds `(procName, selfExpr)` so that
       recursive calls are replaced by applications of the partial def being built. -/
   selfProc : Option (String × Lean.Expr) := none
@@ -59,30 +62,149 @@ private partial def hasSelfCall (procName : String) (stmts : List Core.Statement
     | .block _ body _     => hasSelfCall procName body
     | _                   => false
 
-/-- Detect if a Boole datatype is a singly-linked list of `int` and return the
-    corresponding Lean type (`List Int`). -/
-private def tryMapListDatatype (dt : Lambda.LDatatype Unit) : Option Lean.Expr :=
-  let nilOpt  := dt.constrs.find? (·.args.isEmpty)
-  let consOpt := dt.constrs.find? (·.args.length == 2)
-  match nilOpt, consOpt with
-  | some _, some cons =>
-    let (_, headTy) := cons.args[0]!
-    let (_, tailTy) := cons.args[1]!
-    if headTy == .tcons "int" [] && tailTy == .tcons dt.name [] then
-      some (.app (.const ``List [.zero]) (.const ``Int []))
-    else none
-  | _, _ => none
+/-- Translate a monomorphic Core type using a raw typeMap (used during context construction
+    before an `ExtractCtx` exists). -/
+private def translateTyWithMap (typeMap : Std.HashMap String Lean.Expr) : Lambda.LMonoTy → MetaM Lean.Expr
+  | .tcons "int" []          => return .const ``Int []
+  | .tcons "bool" []         => return .const ``Bool []
+  | .tcons "Sequence" [elem] => do
+      let e ← translateTyWithMap typeMap elem; Meta.mkAppM ``List #[e]
+  | .tcons name [] =>
+      match typeMap[name]? with
+      | some ty => return ty
+      | none    => throwError s!"extract_def: unknown type '{name}'"
+  | ty => throwError s!"extract_def: unsupported type {repr ty}"
 
-/-- Build the type map by scanning the program's type declarations. -/
-def buildTypeMap (program : Core.Program) : Std.HashMap String Lean.Expr :=
-  program.decls.foldl (fun m d =>
-    match d.getTypeDecl? with
-    | some (.data dtBlock) =>
-      dtBlock.foldl (fun m dt =>
-        match tryMapListDatatype dt with
-        | some ty => m.insert dt.name ty
-        | none    => m) m
-    | _ => m) {}
+/-- Decompose a Lean arrow type into its argument types and final return type. -/
+private def decomposeArrowType (ty : Lean.Expr) : List Lean.Expr × Lean.Expr :=
+  match ty with
+  | .forallE _ argTy body _ =>
+    let (args, ret) := decomposeArrowType body
+    (argTy :: args, ret)
+  | _ => ([], ty)
+
+/-- Record that a Boole type name maps to a Lean type expression.
+    Built-in types (`int`, `bool`, `Sequence`) are left to `translateTy`. -/
+private def matchBooleToLean (typeMap : Std.HashMap String Lean.Expr)
+    (booleTy : Lambda.LMonoTy) (leanTy : Lean.Expr) : Std.HashMap String Lean.Expr :=
+  match booleTy with
+  | .tcons name [] =>
+    if name == "int" || name == "bool" || name == "Sequence" then typeMap
+    else typeMap.insert name leanTy
+  | _ => typeMap
+
+/-- Build a tester lambda `fun x => T.casesOn (fun _ => Bool) x case₀ … caseₙ`
+    where only branch `j` returns `true`, all others `false`.
+    `numParams` is the number of type-parameter implicit args before `motive` in `T.casesOn`. -/
+private def buildTesterFun (leanTy : Lean.Expr) (indName : Name) (numParams : Nat)
+    (booleConstrs : List (Lambda.LConstr Unit)) (j : Nat)
+    (typeMap : Std.HashMap String Lean.Expr) : MetaM Lean.Expr := do
+  let motive := Lean.Expr.lam `_ leanTy (.const ``Bool []) .default
+  let indexed := (List.range booleConstrs.length).zip booleConstrs
+  let cases ← indexed.mapM fun (i, constr) => do
+    let result := if i == j then .const ``true [] else .const ``false []
+    constr.args.foldrM (fun (_, fieldTy) acc => do
+      let fTy ← translateTyWithMap typeMap fieldTy
+      return Lean.Expr.lam `_ fTy acc .default) result
+  Meta.withLocalDecl `x .default leanTy fun x => do
+    let nones   := (List.replicate numParams (none : Option Lean.Expr)).toArray
+    let optArgs := nones ++ #[some motive, some x] ++ cases.toArray.map some
+    let app ← Meta.mkAppOptM (Name.str indName "casesOn") optArgs
+    Meta.mkLambdaFVars #[x] app
+
+/-- Build a destructor lambda `fun x => T.casesOn (fun _ => fieldTy) x default₀ … extractor_j … defaultₙ`
+    where branch `ctorIdx` extracts field `fieldIdx` and all other branches return
+    `Inhabited.default` for `fieldType`. -/
+private def buildDestructorFun (leanTy : Lean.Expr) (indName : Name) (numParams : Nat)
+    (booleConstrs : List (Lambda.LConstr Unit)) (ctorIdx fieldIdx : Nat)
+    (fieldType : Lean.Expr) (typeMap : Std.HashMap String Lean.Expr) : MetaM Lean.Expr := do
+  let motive  := Lean.Expr.lam `_ leanTy fieldType .default
+  let u_inh   ← Meta.getLevel fieldType
+  let inhInst ← Meta.synthInstance (.app (.const ``Inhabited [u_inh]) fieldType)
+  let defVal  ← Meta.mkAppOptM ``default #[some fieldType, some inhInst]
+  let indexed := (List.range booleConstrs.length).zip booleConstrs
+  let cases ← indexed.mapM fun (i, constr) => do
+    if i == ctorIdx then
+      let fieldTys ← constr.args.mapM fun (_, ty) => translateTyWithMap typeMap ty
+      let decls := (fieldTys.mapIdx fun k ty =>
+        (Name.mkSimple s!"_f{k}", BinderInfo.default, fun _ : Array Lean.Expr => pure ty)).toArray
+      Meta.withLocalDecls decls fun fvars => Meta.mkLambdaFVars fvars fvars[fieldIdx]!
+    else
+      constr.args.foldrM (fun (_, ty) acc => do
+        let fTy ← translateTyWithMap typeMap ty
+        return Lean.Expr.lam `_ fTy acc .default) defVal
+  Meta.withLocalDecl `x .default leanTy fun x => do
+    let nones   := (List.replicate numParams (none : Option Lean.Expr)).toArray
+    let optArgs := nones ++ #[some motive, some x] ++ cases.toArray.map some
+    let app ← Meta.mkAppOptM (Name.str indName "casesOn") optArgs
+    Meta.mkLambdaFVars #[x] app
+
+/-- Given a Boole `LDatatype` and the Lean type it maps to, look up the Lean inductive's
+    constructors, then build opMap entries for all constructors, testers, and destructors. -/
+private def buildOpMapForIndType (dt : Lambda.LDatatype Unit) (leanTy : Lean.Expr)
+    (typeMap : Std.HashMap String Lean.Expr) : MetaM (Std.HashMap String Lean.Expr) := do
+  let some indName := leanTy.getAppFn.constName?
+    | throwError s!"extract_def: Lean type for '{dt.name}' is not an inductive"
+  let env ← getEnv
+  let some constInfo := env.find? indName
+    | throwError s!"extract_def: '{indName}' not found in the Lean environment"
+  let .inductInfo indInfo := constInfo
+    | throwError s!"extract_def: '{indName}' is not an inductive type in the Lean environment"
+  let numParams     := indInfo.numParams
+  let typeArgs      := leanTy.getAppArgs       -- e.g. #[Int] for List Int
+  let booleConstrs  := dt.constrs              -- List (LConstr Unit)
+  let leanCtorNames := indInfo.ctors           -- List Name (in constructor order)
+  unless booleConstrs.length == leanCtorNames.length do
+    throwError s!"extract_def: constructor count mismatch for '{dt.name}' \
+        (Boole: {booleConstrs.length}, Lean '{indName}': {leanCtorNames.length})"
+  let mut opMap : Std.HashMap String Lean.Expr := {}
+  let mut ctorIdx := 0
+  for (booleConstr, leanCtorName) in booleConstrs.zip leanCtorNames do
+    -- Constructor: partially apply the Lean constructor to any type arguments.
+    let ctorExpr ← Meta.mkAppOptM leanCtorName (typeArgs.map some)
+    opMap := opMap.insert booleConstr.name.name ctorExpr
+    -- Tester.
+    let testerExpr ← buildTesterFun leanTy indName numParams booleConstrs ctorIdx typeMap
+    opMap := opMap.insert booleConstr.testerName testerExpr
+    -- Destructors (safe and unsafe share the same Lean implementation).
+    let mut fieldIdx := 0
+    for (fieldId, fieldTy) in booleConstr.args do
+      let leanFieldTy ← translateTyWithMap typeMap fieldTy
+      let destrExpr ← buildDestructorFun leanTy indName numParams booleConstrs ctorIdx fieldIdx leanFieldTy typeMap
+      opMap := opMap.insert s!"{dt.name}..{fieldId.name}"  destrExpr
+      opMap := opMap.insert s!"{dt.name}..{fieldId.name}!" destrExpr
+      fieldIdx := fieldIdx + 1
+    ctorIdx := ctorIdx + 1
+  return opMap
+
+/-- Build `typeMap` and `opMap` by matching the procedure's Boole parameter types against
+    the Lean types from the user's expected-type annotation.  Unknown ops in procedures that
+    use only `int`/`bool` work fine with empty maps; user-defined types require the annotation. -/
+def buildContextMaps (program : Core.Program) (proc : Core.Procedure)
+    (expectedType : Option Lean.Expr)
+    : MetaM (Std.HashMap String Lean.Expr × Std.HashMap String Lean.Expr) := do
+  let mut typeMap : Std.HashMap String Lean.Expr := {}
+  -- If the user supplied a type annotation, use it to derive Boole→Lean type mappings.
+  if let some expTy := expectedType then
+    let expTy ← instantiateMVars expTy
+    let (leanArgTys, leanRetTy) := decomposeArrowType expTy
+    let booleArgTys := proc.header.inputs.toList.map (·.2)
+    for (b, l) in booleArgTys.zip leanArgTys do
+      typeMap := matchBooleToLean typeMap b l
+    if let some booleRetTy := proc.header.outputs.toList[0]?.map (·.2) then
+      typeMap := matchBooleToLean typeMap booleRetTy leanRetTy
+  -- For each user-defined type in typeMap, build its opMap entries.
+  let mut opMap : Std.HashMap String Lean.Expr := {}
+  for (booleTyName, leanTy) in typeMap.toList do
+    let mDt := program.decls.findSome? fun d =>
+      match d.getTypeDecl? with
+      | some (.data block) => block.find? (·.name == booleTyName)
+      | _ => none
+    if let some dt := mDt then
+      let newOps ← buildOpMapForIndType dt leanTy typeMap
+      for (k, v) in newOps.toList do
+        opMap := opMap.insert k v
+  return (typeMap, opMap)
 
 /-- Translate a monomorphic Core type to a Lean type expression. -/
 def translateTy (ctx : ExtractCtx) : Lambda.LMonoTy → MetaM Lean.Expr
@@ -113,7 +235,7 @@ private def decideExpr (prop : Lean.Expr) : MetaM Lean.Expr := do
   return mkApp2 (.const ``decide []) prop decInst
 
 /-- Apply a binary Core operator to two translated Lean expressions. -/
-private def applyBinOp (opName : String) (e1 e2 : Lean.Expr) : MetaM Lean.Expr := do
+private def applyBinOp (ctx : ExtractCtx) (opName : String) (e1 e2 : Lean.Expr) : MetaM Lean.Expr := do
   match opName with
   | "Int.Add" => Meta.mkAppM ``HAdd.hAdd #[e1, e2]
   | "Int.Sub" => Meta.mkAppM ``HSub.hSub #[e1, e2]
@@ -146,45 +268,26 @@ private def applyBinOp (opName : String) (e1 e2 : Lean.Expr) : MetaM Lean.Expr :
     let dflt   ← Meta.mkAppOptM ``default #[some elemTy, some inst]
     Meta.mkAppM ``List.getD #[e1, i, dflt]
   | "Sequence.contains" => Meta.mkAppM ``List.elem #[e2, e1]
-  -- User-defined list constructor: Cons(head, tail) → head :: tail
-  | "Cons" => Meta.mkAppM ``List.cons #[e1, e2]
-  | _ => throwError s!"extract_def: unsupported binary op '{opName}'"
+  | _ =>
+    match ctx.opMap[opName]? with
+    | some f => return mkApp2 f e1 e2
+    | none   => throwError s!"extract_def: unsupported binary op '{opName}'"
 
 /-- Apply a unary Core operator to a translated Lean expression. -/
-private def applyUnaryOp (opName : String) (e : Lean.Expr) : MetaM Lean.Expr := do
+private def applyUnaryOp (ctx : ExtractCtx) (opName : String) (e : Lean.Expr) : MetaM Lean.Expr := do
   match opName with
   | "Int.Neg"         => Meta.mkAppM ``Neg.neg #[e]
   | "Bool.Not"        => return mkApp (.const ``Bool.not []) e
   | "Sequence.length" => do
     let n ← Meta.mkAppM ``List.length #[e]
     Meta.mkAppM ``Int.ofNat #[n]
-  -- User-defined list ops — names follow Boole's `TypeName..field!` convention
   | op =>
-    if op.endsWith "..isNil" || op == "isNil" then do
-      let listTy ← inferType e
-      let elemTy := listTy.appArg!
-      Meta.mkAppOptM ``List.isEmpty #[some elemTy, some e]
-    else if op.endsWith "..isCons" || op == "isCons" then do
-      let listTy ← inferType e
-      let elemTy := listTy.appArg!
-      let isEmpty ← Meta.mkAppOptM ``List.isEmpty #[some elemTy, some e]
-      return mkApp (.const ``Bool.not []) isEmpty
-    else if op.endsWith "..head!" then
-      Meta.mkAppM ``List.head! #[e]
-    else if op.endsWith "..tail!" || op.endsWith "..tail" then
-      Meta.mkAppM ``List.tail #[e]
-    else if op.endsWith "..head" then do
-      let listTy ← Meta.inferType e
-      let elemTy := listTy.appArg!
-      let u    ← Meta.getLevel elemTy
-      let inst ← Meta.synthInstance (.app (.const ``Inhabited [u]) elemTy)
-      let dflt ← Meta.mkAppOptM ``default #[some elemTy, some inst]
-      Meta.mkAppM ``List.headD #[e, dflt]
-    else
-      throwError s!"extract_def: unsupported unary op '{op}'"
+    match ctx.opMap[op]? with
+    | some f => return mkApp f e
+    | none   => throwError s!"extract_def: unsupported unary op '{op}'"
 
 /-- Apply a ternary Core operator to three translated Lean expressions. -/
-private def applyTernaryOp (opName : String) (e1 e2 e3 : Lean.Expr) : MetaM Lean.Expr := do
+private def applyTernaryOp (_ : ExtractCtx) (opName : String) (e1 e2 e3 : Lean.Expr) : MetaM Lean.Expr := do
   match opName with
   | "Sequence.update" => do
     let i ← Meta.mkAppM ``Int.toNat #[e2]
@@ -217,38 +320,31 @@ partial def translateExpr (ctx : ExtractCtx) (store : Store) : Core.Expression.E
     let e1' ← translateExpr ctx store e1
     let e2' ← translateExpr ctx store e2
     let e3' ← translateExpr ctx store e3
-    applyTernaryOp id.name e1' e2' e3'
+    applyTernaryOp ctx id.name e1' e2' e3'
   -- Binary application: (op e1) e2
   | .app () (.app () (.op () id _) e1) e2 => do
     let e1' ← translateExpr ctx store e1
     let e2' ← translateExpr ctx store e2
-    applyBinOp id.name e1' e2'
+    applyBinOp ctx id.name e1' e2'
   -- Unary application: op e
   | .app () (.op () id _) e => do
     let e' ← translateExpr ctx store e
-    applyUnaryOp id.name e'
+    applyUnaryOp ctx id.name e'
   | .app () _ _ =>
     throwError "extract_def: unsupported application form in expression"
-  -- Nullary ops: Sequence.empty and user-defined Nil constructors
+  -- Nullary ops: Sequence.empty and user-defined constructors (via opMap)
   | .op () id opTy =>
-    match id.name, opTy with
-    | "Sequence.empty", some (.tcons "Sequence" [elemTy]) => do
-      let leanElem ← translateTy ctx elemTy
-      Meta.mkAppOptM ``List.nil #[some leanElem]
-    | "Nil", _ => do
-      -- Look up the list element type from typeMap
-      let leanElemTy ← match opTy with
-        | some (.tcons dtName []) =>
-          match ctx.typeMap[dtName]? with
-          | some lty => pure lty.appArg!
-          | none     => pure (.const ``Int [])
-        | _ =>
-          -- Fallback: pick the element type of the first list type in the map
-          match ctx.typeMap.toList.head? with
-          | some (_, lty) => pure lty.appArg!
-          | none          => pure (.const ``Int [])
-      Meta.mkAppOptM ``List.nil #[some leanElemTy]
-    | name, _ => throwError s!"extract_def: bare op '{name}' without application"
+    match id.name with
+    | "Sequence.empty" =>
+      match opTy with
+      | some (.tcons "Sequence" [elemTy]) => do
+        let leanElem ← translateTy ctx elemTy
+        Meta.mkAppOptM ``List.nil #[some leanElem]
+      | _ => throwError "extract_def: Sequence.empty without a Sequence return type"
+    | name =>
+      match ctx.opMap[name]? with
+      | some e => return e
+      | none   => throwError s!"extract_def: bare op '{name}' not found in opMap"
   | .bvar () i =>
     throwError s!"extract_def: unexpected bound variable at index {i}"
   | .abs () _ _ _ =>
@@ -483,7 +579,7 @@ initial version.
 syntax (name := extractDefTerm) "extract_def" term:max str : term
 
 private unsafe def elabExtractDefUnsafe
-    (stx : Lean.Syntax) (_ : Option Lean.Expr) : TermElabM Lean.Expr := do
+    (stx : Lean.Syntax) (expectedType : Option Lean.Expr) : TermElabM Lean.Expr := do
   let some procName := stx[2].isStrLit?
     | throwError "extract_def: expected a string literal as the second argument"
 
@@ -501,9 +597,9 @@ private unsafe def elabExtractDefUnsafe
   let some proc := Core.Program.Procedure.find? coreProgram procName
     | throwError s!"extract_def: procedure '{procName}' not found in the Core program"
 
-  -- Symbolically translate the procedure to a Lean term
-  let typeMap := LeanExtract.buildTypeMap coreProgram
-  let ctx : LeanExtract.ExtractCtx := { program := coreProgram, typeMap }
+  -- Build type and op maps, using the user's expected type annotation when available
+  let (typeMap, opMap) ← LeanExtract.buildContextMaps coreProgram proc expectedType
+  let ctx : LeanExtract.ExtractCtx := { program := coreProgram, typeMap, opMap }
   LeanExtract.translateProcedure ctx proc
 
 @[implemented_by elabExtractDefUnsafe]
