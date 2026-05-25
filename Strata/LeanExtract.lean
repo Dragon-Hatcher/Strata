@@ -36,6 +36,21 @@ def toCoreProgram (program : Strata.Program) : Option Core.Program := do
   else
     none
 
+/--
+Convert a `Strata.Program` to a `Core.Program` without loop elimination.
+Used by `extract_def` so that loops are preserved for semantic extraction rather
+than replaced by the verification-only assert/assume/havoc encoding.
+-/
+def toCoreProgramForExtract (program : Strata.Program) : Option Core.Program := do
+  if program.dialect == "Boole" then
+    let booleProgram ← (Boole.getProgram program).toOption
+    (Boole.toCoreProgram booleProgram program.globalContext).toOption
+  else if program.dialect == "Core" then
+    let (p, #[]) := TransM.run default (translateProgram program) | none
+    return p
+  else
+    none
+
 namespace LeanExtract
 
 /-- A symbolic store mapping variable names to their current Lean-expression values. -/
@@ -369,6 +384,33 @@ private def mergeStores (cond : Lean.Expr) (baseStore storeT storeF : Store) : M
       merged := merged.insert key (← boolIteM cond tVal fVal)
   return merged
 
+/-- Try to extract the counter variable from a for-loop body.
+    Returns `(counterName, bodyWithoutStep)` if the last statement is
+    `counter := counter + 1` (or `counter := counter + stepLiteral`). -/
+private def extractCounterFromBody (body : List Core.Statement)
+    : Option (String × List Core.Statement) :=
+  match body.getLast? with
+  | some (.cmd (.cmd (.set cid (.det
+      (.app () (.app () (.op () addId _) (.fvar () fid _)) (.const () (.intConst stepN)))) _))) =>
+    if addId.name == "Int.Add" && cid.name == fid.name && stepN == 1 then
+      some (cid.name, body.dropLast)
+    else none
+  | _ => none
+
+/-- Extract `(limitExpr, exclusive)` from a counting loop guard.
+    Returns `some (limit, false)` for `counter <= limit` (inclusive upper bound),
+    `some (limit, true)` for `counter < limit` (exclusive upper bound). -/
+private def extractCountingBound (guard : Core.Expression.Expr) (counterName : String)
+    : Option (Core.Expression.Expr × Bool) :=
+  match guard with
+  | .app () (.app () (.op () opId _) (.fvar () cid _)) limitExpr =>
+    if cid.name == counterName then
+      if opId.name == "Int.Le" then some (limitExpr, false)
+      else if opId.name == "Int.Lt" then some (limitExpr, true)
+      else none
+    else none
+  | _ => none
+
 /-- Symbolically execute a list of Core statements, threading the store through. -/
 partial def executeStmts (ctx : ExtractCtx) (store : Store) (stmts : List Core.Statement) : MetaM Store :=
   stmts.foldlM (executeStmt ctx) store
@@ -469,11 +511,77 @@ where
     | .ite .nondet _ _ _ =>
       throwError "extract_def: nondeterministic branch conditions are not supported"
     | .block _ body _ => executeStmts ctx store body
-    | .loop _ _ _ _ _ =>
-      throwError "extract_def: loops must be eliminated before extraction"
+    | .loop (.det guardE) _ _ body _ =>
+      executeCountingLoop ctx store guardE body
+    | .loop .nondet _ _ _ _ =>
+      throwError "extract_def: nondeterministic loop guards are not supported"
     | .exit _ _ => return store
     | .funcDecl _ _ => return store
     | .typeDecl _ _ => return store
+  /-- Execute a counting for-loop (`for i := lo to hi`) as a `List.foldl` over `List.range`.
+      Recognises the pattern where the body ends with `counter := counter + 1`, computes
+      the trip count from the guard (`counter <= hi` or `counter < hi`), and folds over
+      the single accumulator variable modified by the loop body. -/
+  executeCountingLoop (ctx : ExtractCtx) (store : Store)
+      (guardE : Core.Expression.Expr) (body : List Core.Statement) : MetaM Store := do
+    -- Detect counter: the last body statement must be `counter := counter + 1`.
+    let some (counterName, bodyNoStep) := extractCounterFromBody body
+      | throwError "extract_def: loop body must end with a +1 counter increment \
+            (e.g. `i := i + 1`)"
+    -- The counter must already be in the store (set by the `init` before the loop).
+    let some counterInit := store[counterName]?
+      | throwError s!"extract_def: loop counter '{counterName}' not initialised in store"
+    -- Extract the upper bound from the guard.
+    let some (limitCoreExpr, exclusive) := extractCountingBound guardE counterName
+      | throwError "extract_def: loop guard must be 'counter <= limit' or 'counter < limit'"
+    let limitLean ← translateExpr ctx store limitCoreExpr
+    -- Compute the trip count as a `Nat`:
+    --   inclusive (<=): hi - lo + 1
+    --   exclusive (<):  hi - lo
+    let tripInt ← if exclusive then
+      Meta.mkAppM ``HSub.hSub #[limitLean, counterInit]
+    else
+      Meta.mkAppM ``HAdd.hAdd
+        #[← Meta.mkAppM ``HSub.hSub #[limitLean, counterInit], toExpr (1 : Int)]
+    let tripNat ← Meta.mkAppM ``Int.toNat #[tripInt]
+    -- Collect the accumulator variables: variables assigned in bodyNoStep, except the counter.
+    let allModified := (Imperative.Block.modifiedVars bodyNoStep).map (·.name) |>.eraseDups
+    let accVars := allModified.filter (· != counterName)
+    -- Get initial values and types.
+    let accInits ← accVars.mapM fun v =>
+      match store[v]? with
+      | some e => return e
+      | none => throwError s!"extract_def: loop accumulator '{v}' not found in store"
+    let accTypes ← accInits.mapM Meta.inferType
+    -- Build a `List.foldl` for a single accumulator.  For multiple accumulators
+    -- we would need to build a tuple, which is not yet supported.
+    match accVars, accInits, accTypes with
+    | [accName], [accInit], [accType] =>
+      let listRange ← Meta.mkAppM ``List.range #[tripNat]
+      let foldLambda ←
+        Meta.withLocalDecl `acc .default accType fun accFv =>
+        Meta.withLocalDecl `j .default (.const ``Nat []) fun jNat => do
+          let jInt ← Meta.mkAppM ``Int.ofNat #[jNat]
+          let iVal ← Meta.mkAppM ``HAdd.hAdd #[counterInit, jInt]
+          let mut loopStore := store
+          loopStore := loopStore.insert counterName iVal
+          loopStore := loopStore.insert accName accFv
+          let finalStore ← executeStmts ctx loopStore bodyNoStep
+          let some newAcc := finalStore[accName]?
+            | throwError s!"extract_def: accumulator '{accName}' not assigned in loop body"
+          Meta.mkLambdaFVars #[accFv, jNat] newAcc
+      let result ← Meta.mkAppM ``List.foldl #[foldLambda, accInit, listRange]
+      let mut finalStore := store
+      finalStore := finalStore.insert accName result
+      let finalI ← Meta.mkAppM ``HAdd.hAdd
+          #[counterInit, ← Meta.mkAppM ``Int.ofNat #[tripNat]]
+      finalStore := finalStore.insert counterName finalI
+      return finalStore
+    | [], _, _ =>
+      throwError "extract_def: counting loop with no accumulator variables is not supported"
+    | _, _, _ =>
+      throwError s!"extract_def: counting loop with multiple accumulator variables \
+            ({accVars}) is not yet supported"
 
 /--
 Replace `Bool.casesOn motive (decide p inst) falseCase trueCase` with
@@ -785,8 +893,11 @@ private unsafe def elabExtractDefUnsafe
   -- Elaborate the Strata.Program argument
   let programExpr ← elabTerm stx[1] (some (Lean.mkConst ``Strata.Program))
 
-  -- Build Strata.toCoreProgram programExpr and evaluate it at meta-time
-  let toCoreProgramApp := .app (.const ``Strata.toCoreProgram []) programExpr
+  -- Build Strata.toCoreProgramForExtract programExpr and evaluate it at meta-time.
+  -- We deliberately skip loop elimination here: loops are handled semantically by
+  -- the extractor (via executeCountingLoop) rather than being replaced with the
+  -- verification-only assert/assume/havoc encoding.
+  let toCoreProgramApp := .app (.const ``Strata.toCoreProgramForExtract []) programExpr
   let optCoreProgramTy := .app (.const ``Option [0]) (.const ``Core.Program [])
   let some coreProgram ← Meta.evalExpr (Option Core.Program) optCoreProgramTy toCoreProgramApp
     | throwError "extract_def: could not convert program to Core \
