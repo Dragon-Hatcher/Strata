@@ -87,6 +87,7 @@ private def translateTyWithMap (typeMap : Std.HashMap String Lean.Expr) : Lambda
   | .tcons "bool" []         => return .const ``Bool []
   | .tcons "Sequence" [elem] => do
       let e ← translateTyWithMap typeMap elem; Meta.mkAppM ``List #[e]
+  | .bitvec n                => return mkApp (.const ``BitVec []) (mkNatLit n)
   | .tcons name [] =>
       match typeMap[name]? with
       | some ty => return ty
@@ -109,6 +110,7 @@ private def matchBooleToLean (typeMap : Std.HashMap String Lean.Expr)
   | .tcons name [] =>
     if name == "int" || name == "bool" || name == "Sequence" then typeMap
     else typeMap.insert name leanTy
+  | .bitvec _ => typeMap  -- built-in; mapped directly by translateTy
   | _ => typeMap
 
 /-- Build a tester lambda `fun x => T.casesOn (fun _ => Bool) x case₀ … caseₙ`
@@ -231,6 +233,7 @@ def translateTy (ctx : ExtractCtx) : Lambda.LMonoTy → MetaM Lean.Expr
   | .tcons "Sequence" [elem]  => do
     let leanElem ← translateTy ctx elem
     Meta.mkAppM ``List #[leanElem]
+  | .bitvec n                 => return mkApp (.const ``BitVec []) (mkNatLit n)
   | .tcons name [] =>
     match ctx.typeMap[name]? with
     | some ty => return ty
@@ -286,10 +289,25 @@ private def applyBinOp (ctx : ExtractCtx) (opName : String) (e1 e2 : Lean.Expr) 
     let dflt   ← Meta.mkAppOptM ``default #[some elemTy, some inst]
     Meta.mkAppM ``List.getD #[e1, i, dflt]
   | "Sequence.contains" => Meta.mkAppM ``List.elem #[e2, e1]
-  | _ =>
-    match ctx.opMap[opName]? with
-    | some f => return mkApp2 f e1 e2
-    | none   => throwError s!"extract_def: unsupported binary op '{opName}'"
+  | opName =>
+    -- Bitvector ops: "Bv{n}.{kind}" (e.g. "Bv8.Xor", "Bv8.Add")
+    if opName.startsWith "Bv" then
+      let kind := (opName.splitOn ".").getLast?.getD ""
+      match kind with
+      | "Xor" => Meta.mkAppM ``HXor.hXor #[e1, e2]
+      | "And" => Meta.mkAppM ``HAnd.hAnd #[e1, e2]
+      | "Or"  => Meta.mkAppM ``HOr.hOr  #[e1, e2]
+      | "Add" => Meta.mkAppM ``HAdd.hAdd #[e1, e2]
+      | "Sub" => Meta.mkAppM ``HSub.hSub #[e1, e2]
+      | "Mul" => Meta.mkAppM ``HMul.hMul #[e1, e2]
+      | _ =>
+        match ctx.opMap[opName]? with
+        | some f => return mkApp2 f e1 e2
+        | none   => throwError s!"extract_def: unsupported bitvector binary op '{opName}'"
+    else
+      match ctx.opMap[opName]? with
+      | some f => return mkApp2 f e1 e2
+      | none   => throwError s!"extract_def: unsupported binary op '{opName}'"
 
 /-- Apply a unary Core operator to a translated Lean expression. -/
 private def applyUnaryOp (ctx : ExtractCtx) (opName : String) (e : Lean.Expr) : MetaM Lean.Expr := do
@@ -317,9 +335,10 @@ partial def translateExpr (ctx : ExtractCtx) (store : Store) : Core.Expression.E
   | .const () (.intConst i) => return toExpr i
   | .const () (.boolConst b) => return toExpr b
   | .const () (.strConst _)
-  | .const () (.realConst _)
-  | .const () (.bitvecConst _ _) =>
-    throwError "extract_def: bitvec/real/string constants are not supported"
+  | .const () (.realConst _) =>
+    throwError "extract_def: real/string constants are not supported"
+  | .const () (.bitvecConst n b) =>
+    return mkApp2 (mkConst ``BitVec.ofNat) (mkNatLit n) (mkNatLit b.toNat)
   | .fvar () id _ =>
     match store[id.name]? with
     | some e => return e
